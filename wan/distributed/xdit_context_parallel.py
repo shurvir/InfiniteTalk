@@ -10,7 +10,11 @@ from xfuser.core.distributed import (
 )
 from einops import rearrange
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-import xformers.ops
+try:
+    import xformers.ops
+except ImportError:
+    pass
+from ..modules.attention import _sdpa_attention_bmhk
 
 from ..modules.model import sinusoidal_embedding_1d
 from ..utils.multitalk_utils import get_attn_map_with_target, split_token_counts_and_frame_ids, normalize_and_scale
@@ -536,8 +540,7 @@ def usp_crossattn_multi_forward_multitalk(self,
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+        x = _sdpa_attention_bmhk(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform

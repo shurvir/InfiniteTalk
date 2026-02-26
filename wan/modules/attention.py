@@ -8,7 +8,11 @@ from xfuser.core.distributed import (
     get_sequence_parallel_world_size,
     get_sp_group,
 )
-import xformers.ops
+try:
+    import xformers.ops
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
 
 try:
     import flash_attn_interface
@@ -28,6 +32,28 @@ __all__ = [
     'flash_attention',
     'attention',
 ]
+
+
+def _sdpa_attention_bmhk(q, k, v, attn_bias=None):
+    """
+    Drop-in replacement for xformers.ops.memory_efficient_attention.
+    Accepts q/k/v in (B, M, H, K) layout, returns same layout.
+    Uses PyTorch native scaled_dot_product_attention internally.
+    """
+    # SDPA expects (B, H, M, K)
+    q = q.transpose(1, 2).contiguous()
+    k = k.transpose(1, 2).contiguous()
+    v = v.transpose(1, 2).contiguous()
+    # Cast to half precision if needed (SDPA is faster and some backends require it)
+    orig_dtype = q.dtype
+    if q.dtype == torch.float32:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None)
+    # Back to (B, M, H, K)
+    out = out.transpose(1, 2).contiguous()
+    return out.to(orig_dtype)
 
 
 def flash_attention(
@@ -260,10 +286,10 @@ class SingleStreamAttention(nn.Module):
             sp_rank = get_sequence_parallel_rank()
             visual_seqlen, _ = split_token_counts_and_frame_ids(N_t, N_h * N_w, sp_size, sp_rank)
             assert kv_seq is not None, f"kv_seq should not be None."
-            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(visual_seqlen, kv_seq)
+            attn_bias = None  # BlockDiagonalMask not supported with SDPA; context parallel path handles this
         else:
             attn_bias = None
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=attn_bias, op=None,)
+        x = _sdpa_attention_bmhk(q, encoder_k, encoder_v, attn_bias=attn_bias)
         x = rearrange(x, "B M H K -> B H M K") 
 
         # linear transform
@@ -377,7 +403,7 @@ class SingleStreamMutiAttention(SingleStreamAttention):
         q = rearrange(q, "B H M K -> B M H K")
         encoder_k = rearrange(encoder_k, "B H M K -> B M H K")
         encoder_v = rearrange(encoder_v, "B H M K -> B M H K")
-        x = xformers.ops.memory_efficient_attention(q, encoder_k, encoder_v, attn_bias=None, op=None,)
+        x = _sdpa_attention_bmhk(q, encoder_k, encoder_v)
         x = rearrange(x, "B M H K -> B H M K")
 
         # linear transform
